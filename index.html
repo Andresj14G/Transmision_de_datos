@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0b141a">
-  <meta name="description" content="SoundBridge convierte tus mensajes en audios que puedes reproducir y compartir. Ábrelos en otro teléfono para leerlos, sin micrófono.">
+  <meta name="description" content="SoundBridge convierte tus mensajes en sonido: el teléfono cercano los escucha y los escribe en el chat, sin enviar archivos.">
   <title>SoundBridge</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230b141a'/%3E%3Cpath d='M8 34c4 0 4-12 8-12s4 22 8 22 4-28 8-28 4 34 8 34 4-26 8-26 4 14 8 14' fill='none' stroke='%232dd4bf' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
@@ -27,7 +27,7 @@
       </div>
       <div class="topbar-actions">
         <button class="icon-btn mic-btn" id="btnMic" type="button" aria-pressed="false"
-                aria-label="Activar micrófono (opcional)" title="Micrófono (opcional)">
+                aria-label="Micrófono" title="Micrófono">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 3.5a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0v-5a3 3 0 0 1 3-3Z" fill="none" stroke="currentColor" stroke-width="1.8"></path>
             <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
@@ -56,9 +56,9 @@
                 fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
         </svg>
         <h2>Mensajes que suenan</h2>
-        <p>Escribe y envía: tu texto se convierte en un audio.<br>
-           Comparte el audio o ábrelo en otro teléfono para leerlo.</p>
-        <p class="empty-hint">Con el clip puedes abrir un audio y transcribirlo, sin micrófono.</p>
+        <p>Escribe y envía: tu texto aparece y, enseguida, suena como audio.<br>
+           El otro teléfono, si está cerca con el micrófono activo, lo escucha y lo escribe solo.</p>
+        <p class="empty-hint">Compartir el audio o abrir un archivo con el clip es opcional.</p>
       </div>
       <div class="messages" id="messages" role="log" aria-live="polite" aria-label="Mensajes"></div>
     </main>

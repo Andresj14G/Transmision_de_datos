@@ -1,7 +1,8 @@
 /*
  * SoundBridge · mensajes que suenan.
- * Escribe un mensaje, se convierte en un audio reproducible y puede compartirse.
- * Otro teléfono puede abrir ese audio y obtener el texto sin micrófono.
+ * Escribes un mensaje: aparece como texto y, justo después, como un audio que suena.
+ * El otro teléfono, si está en rango, lo escucha con el micrófono y lo escribe solo
+ * en el chat. Compartir o descargar el audio es opcional.
  */
 (function () {
   'use strict';
@@ -54,6 +55,8 @@
     transcribing: false,
     micMutedUntil: 0,
     micAutoRetry: false,
+    micOptOut: false,
+    micRetryArmed: false,
     mic: {
       active: false,
       busy: false,
@@ -109,7 +112,7 @@
   function baseStatus() {
     if (state.mic.active) setStatus('Escuchando el aire · micrófono activo', 'listening');
     else if (state.mic.busy) setStatus('Activando micrófono…', 'syncing');
-    else setStatus('Micrófono apagado · toca el icono para escuchar', '');
+    else setStatus(state.micOptOut ? 'Micrófono silenciado · toca el icono para escuchar' : 'Listo · escribe un mensaje', '');
   }
 
   function scheduleStatusRevert(delay) {
@@ -478,9 +481,25 @@
   function buildActions(entry) {
     var actions = document.createElement('span');
     actions.className = 'msg-actions';
-    actions.appendChild(miniButton(ICON_SHARE, 'Compartir audio', function () { shareEntry(entry); }));
-    actions.appendChild(miniButton(ICON_DOWNLOAD, 'Descargar audio', function () { downloadEntry(entry); }));
     actions.appendChild(miniButton(ICON_COPY, 'Copiar texto', function () { copyEntry(entry); }));
+    
+    var shareBtn = miniButton(ICON_SHARE, 'Compartir audio (opcional)', function () { shareEntry(entry); });
+    var downloadBtn = miniButton(ICON_DOWNLOAD, 'Descargar audio (opcional)', function () { downloadEntry(entry); });
+    
+    var moreBtn = miniButton(
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="18" r="1.5" fill="currentColor"/></svg>',
+      'Opciones de audio (opcional)',
+      function () {
+        if (shareBtn.parentElement) {
+          shareBtn.remove();
+          downloadBtn.remove();
+        } else {
+          actions.insertBefore(shareBtn, actions.firstChild);
+          actions.insertBefore(downloadBtn, actions.firstChild);
+        }
+      }
+    );
+    actions.appendChild(moreBtn);
     return actions;
   }
 
@@ -488,7 +507,7 @@
    * Burbujas
    * ------------------------------------------------------------------ */
 
-  function buildOutgoing(text, emission) {
+  function buildOutgoingText(text) {
     var id = ++state.seq;
     var article = document.createElement('article');
     article.className = 'msg';
@@ -501,7 +520,51 @@
       direction: 'out',
       text: text,
       time: Date.now(),
-      label: '',
+      label: 'texto',
+      el: article
+    };
+
+    var p = document.createElement('p');
+    p.className = 'msg-text';
+    p.textContent = text;
+    article.appendChild(p);
+
+    var meta = document.createElement('div');
+    meta.className = 'msg-meta';
+
+    var time = document.createElement('span');
+    time.className = 'msg-time';
+    time.textContent = formatTime(new Date(entry.time));
+    meta.appendChild(time);
+
+    var actions = document.createElement('span');
+    actions.className = 'msg-actions';
+    actions.appendChild(miniButton(ICON_COPY, 'Copiar texto', function () { copyEntry(entry); }));
+    meta.appendChild(actions);
+
+    article.appendChild(meta);
+    els.messages.appendChild(article);
+
+    state.entries.push(entry);
+    hideEmptyState();
+    scrollToBottom();
+    return entry;
+  }
+
+  function buildOutgoingAudio(text, emission) {
+    var id = ++state.seq;
+    var article = document.createElement('article');
+    article.className = 'msg';
+    article.dataset.direction = 'out';
+    article.dataset.id = 'm' + id;
+    article.setAttribute('role', 'listitem');
+
+    var entry = {
+      id: 'm' + id,
+      direction: 'out',
+      text: text,
+      time: Date.now(),
+      label: 'audio',
       duration: emission.duration,
       preset: emission.preset,
       reps: emission.reps,
@@ -513,10 +576,10 @@
       audio: null
     };
 
-    var p = document.createElement('p');
-    p.className = 'msg-text';
-    p.textContent = text;
-    article.appendChild(p);
+    var label = document.createElement('span');
+    label.className = 'msg-label';
+    label.textContent = 'audio del mensaje';
+    article.appendChild(label);
 
     article.appendChild(buildVoice(entry));
 
@@ -702,14 +765,18 @@
       return;
     }
 
-    var first = state.entries.length === 0;
-    var entry = buildOutgoing(limited.text, emission);
+    // Primero el texto y, como mensaje aparte, el audio que suena.
+    buildOutgoingText(limited.text);
+    var audioEntry = buildOutgoingAudio(limited.text, emission);
     state.lastEmitted = {
       text: limited.text,
       until: Date.now() + emission.duration * 1000 + ECHO_MARGIN_MS
     };
-    if (first) toast('Audio generado. Compártelo o ábrelo en otro teléfono.', 'ok');
-    playEntry(entry);
+    playEntry(audioEntry);
+
+    // Para recibir respuestas sin tocar nada más, se enciende el micrófono
+    // (este toque cuenta como gesto de usuario) salvo que lo hayas silenciado tú.
+    if (!state.mic.active && !state.mic.busy && !state.micOptOut) startMic({ auto: true });
   }
 
   els.composer.addEventListener('submit', function (event) {
@@ -827,6 +894,32 @@
     });
   }
 
+  // Si el navegador deja el micrófono suspendido hasta que haya un toque, se reanuda con el primero.
+  function resumeOnGesture(ctx) {
+    if (!ctx || ctx.state !== 'suspended') return;
+    var handler = function () {
+      document.removeEventListener('pointerdown', handler, true);
+      document.removeEventListener('keydown', handler, true);
+      if (ctx.state === 'suspended') ctx.resume().catch(function () {});
+    };
+    document.addEventListener('pointerdown', handler, true);
+    document.addEventListener('keydown', handler, true);
+  }
+
+  // Si el arranque automático falla (permiso o política del navegador), se reintenta con el primer toque.
+  function armMicRetry() {
+    if (state.micRetryArmed) return;
+    state.micRetryArmed = true;
+    var handler = function () {
+      document.removeEventListener('pointerdown', handler, true);
+      document.removeEventListener('keydown', handler, true);
+      state.micRetryArmed = false;
+      if (!state.mic.active && !state.mic.busy && !state.micOptOut) startMic();
+    };
+    document.addEventListener('pointerdown', handler, true);
+    document.addEventListener('keydown', handler, true);
+  }
+
   async function startMic(options) {
     options = options || {};
     var auto = options.auto === true;
@@ -863,6 +956,7 @@
       if (ctx.state === 'suspended') {
         // Sin gesto de usuario puede quedar suspendido; se reanuda al primer toque.
         ctx.resume().catch(function () {});
+        resumeOnGesture(ctx);
       }
 
       var source = ctx.createMediaStreamSource(stream);
@@ -932,7 +1026,7 @@
 
       setMicUI(true, false);
       setStatus('Micrófono activo · escuchando', 'listening');
-      toast('Micrófono activo. También puedes compartir los audios.', 'ok');
+      if (!auto) toast('Micrófono activo. Recibirás los mensajes cercanos automáticamente.', 'ok');
     } catch (error) {
       if (stream) {
         try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* nada */ }
@@ -942,6 +1036,7 @@
       var message = micErrorMessage(error);
       setStatus(message, 'error');
       toast(message, 'error');
+      if (auto) armMicRetry();
     }
   }
 
@@ -975,8 +1070,13 @@
 
   els.btnMic.addEventListener('click', function () {
     if (state.mic.busy) return;
-    if (state.mic.active) stopMic();
-    else startMic();
+    if (state.mic.active) {
+      state.micOptOut = true; // silenciado a propósito: no se reactiva solo
+      stopMic();
+    } else {
+      state.micOptOut = false;
+      startMic();
+    }
   });
 
   /* ------------------------------------------------------------------ *
@@ -1108,6 +1208,9 @@
     updateConnection();
     autoGrow();
     els.levelFill.style.width = '2%';
+
+    // Escucha desde el primer momento: no hace falta enviar ni abrir ningún archivo.
+    startMic({ auto: true });
 
     window.addEventListener('online', updateConnection);
     window.addEventListener('offline', updateConnection);
