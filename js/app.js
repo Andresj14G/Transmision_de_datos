@@ -1,6 +1,7 @@
 /*
- * Susurro · aplicación de chat por sonido.
- * Interfaz, emisión, micrófono, transcripción de archivos y ajustes.
+ * SoundBridge · mensajes que suenan.
+ * Escribe un mensaje, se convierte en un audio reproducible y puede compartirse.
+ * Otro teléfono puede abrir ese audio y obtener el texto sin micrófono.
  */
 (function () {
   'use strict';
@@ -11,55 +12,48 @@
     return;
   }
 
-  var STORAGE_KEY = 'susurro:ajustes';
   var DUPLICATE_WINDOW_MS = 15000;
   var MAX_INPUT_PX = 96;
   var ECHO_MARGIN_MS = 3000;
 
+  // Parámetros fijos del audio generado (sin panel de ajustes).
+  var EMIT_PRESET = 'normal';
+  var EMIT_REPS = 2;
+  var EMIT_VOLUME = 0.9;
+  var RECEIVE_REPS = 2;
+  var RECEIVE_VOLUME = 0.85;
+
   var $ = function (id) { return document.getElementById(id); };
 
   var els = {
-    app: $('app'),
     chat: $('chat'),
     messages: $('messages'),
     emptyState: $('emptyState'),
     statusText: $('statusText'),
     statusDot: $('statusDot'),
+    micLevel: $('micLevel'),
     levelFill: $('levelFill'),
     connectionText: $('connectionText'),
     connectionLabel: $('connectionLabel'),
-    btnSettings: $('btnSettings'),
-    btnCloseSettings: $('btnCloseSettings'),
-    btnListen: $('btnListen'),
-    listenLabel: document.querySelector('.listen-label'),
+    btnMic: $('btnMic'),
     composer: $('composer'),
     inputText: $('inputText'),
     btnSend: $('btnSend'),
     btnClip: $('btnClip'),
     fileInput: $('fileInput'),
-    settingsPanel: $('settingsPanel'),
-    settingsNote: $('settingsNote'),
-    profileRapido: $('profileRapido'),
-    profileNormal: $('profileNormal'),
-    profileAlcance: $('profileAlcance'),
-    rangeReps: $('rangeReps'),
-    rangeVolume: $('rangeVolume'),
-    repsValue: $('repsValue'),
-    volumeValue: $('volumeValue'),
     toasts: $('toasts')
   };
 
   var state = {
-    settings: { preset: 'normal', reps: 2, volume: 85 },
     seq: 0,
-    messages: [],
+    entries: [],
     incoming: [],
-    emissions: new Map(),
-    audioCtx: null,
     playing: null,
     lastEmitted: null,
     statusTimer: 0,
     transcribing: false,
+    micMutedUntil: 0,
+    micAutoRetry: false,
     mic: {
       active: false,
       busy: false,
@@ -77,6 +71,16 @@
   };
 
   /* ------------------------------------------------------------------ *
+   * Iconos
+   * ------------------------------------------------------------------ */
+
+  var ICON_PLAY = '<svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10-6.5-10-6.5Z" fill="currentColor"></path></svg>';
+  var ICON_PAUSE = '<svg class="icon-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h3v14H8zM13 5h3v14h-3z" fill="currentColor"></path></svg>';
+  var ICON_SHARE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+  var ICON_DOWNLOAD = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+  var ICON_COPY = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path></svg>';
+
+  /* ------------------------------------------------------------------ *
    * Utilidades de interfaz
    * ------------------------------------------------------------------ */
 
@@ -89,11 +93,12 @@
     }
   }
 
-  function formatSeconds(seconds) {
+  function formatClock(seconds) {
     if (!isFinite(seconds) || seconds < 0) seconds = 0;
-    var rounded = Math.round(seconds * 10) / 10;
-    var text = rounded >= 10 ? String(Math.round(rounded)) : String(rounded);
-    return text.replace('.', ',') + ' s';
+    var total = Math.round(seconds);
+    var minutes = Math.floor(total / 60);
+    var rest = total % 60;
+    return minutes + ':' + String(rest).padStart(2, '0');
   }
 
   function setStatus(text, kind) {
@@ -102,15 +107,15 @@
   }
 
   function baseStatus() {
-    if (state.mic.active) setStatus('Escuchando…', 'listening');
-    else setStatus('Micrófono apagado', '');
+    if (state.mic.active) setStatus('Escuchando el aire · micrófono activo', 'listening');
+    else if (state.mic.busy) setStatus('Activando micrófono…', 'syncing');
+    else setStatus('Micrófono apagado · toca el icono para escuchar', '');
   }
 
   function scheduleStatusRevert(delay) {
     clearTimeout(state.statusTimer);
     state.statusTimer = setTimeout(function () {
-      if (state.mic.active) setStatus('Escuchando…', 'listening');
-      else setStatus('Micrófono apagado', '');
+      baseStatus();
     }, delay == null ? 2800 : delay);
   }
 
@@ -152,232 +157,331 @@
     input.style.overflowY = input.scrollHeight > MAX_INPUT_PX ? 'auto' : 'hidden';
   }
 
+  function slugFor(text) {
+    var base = String(text).toLowerCase();
+    if (base.normalize) base = base.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    base = base.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+    return 'soundbridge-' + (base || 'mensaje') + '-' + Date.now() + '.wav';
+  }
+
   /* ------------------------------------------------------------------ *
-   * Ajustes
+   * Notas de audio
    * ------------------------------------------------------------------ */
 
-  function loadSettings() {
-    try {
-      var raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      var saved = JSON.parse(raw);
-      var preset = PHY.getPreset(saved && saved.preset);
-      if (saved && saved.preset && PHY.PRESETS[preset.id]) state.settings.preset = preset.id;
-      if (saved && saved.reps != null) {
-        var reps = Math.round(Number(saved.reps));
-        if (reps >= 1 && reps <= 5) state.settings.reps = reps;
-      }
-      if (saved && saved.volume != null) {
-        var vol = Math.round(Number(saved.volume));
-        if (vol >= 10 && vol <= 100) state.settings.volume = vol;
-      }
-    } catch (e) { /* sin ajustes guardados */ }
-  }
-
-  function saveSettings() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.settings));
-    } catch (e) { /* almacenamiento no disponible */ }
-  }
-
-  function syncSettingsUI() {
-    var s = state.settings;
-    els.profileRapido.checked = s.preset === 'rapido';
-    els.profileNormal.checked = s.preset === 'normal';
-    els.profileAlcance.checked = s.preset === 'alcance';
-    els.rangeReps.value = String(s.reps);
-    els.rangeVolume.value = String(s.volume);
-    els.repsValue.textContent = String(s.reps);
-    els.volumeValue.textContent = String(s.volume);
-    updateSettingsNote();
-  }
-
-  function updateSettingsNote() {
-    var preset = PHY.getPreset(state.settings.preset);
-    var text = els.inputText.value || 'Mensaje de ejemplo';
-    var seconds = PHY.estimateDuration(text, {
-      preset: preset.id,
-      reps: state.settings.reps
+  function createEmission(text, options) {
+    options = options || {};
+    var rendered = PHY.renderAudio(text, {
+      preset: options.preset || EMIT_PRESET,
+      reps: options.reps == null ? EMIT_REPS : options.reps,
+      amplitude: options.amplitude == null ? EMIT_VOLUME : options.amplitude
     });
-    els.settingsNote.innerHTML =
-      '<strong>' + preset.name + '</strong> · ' + preset.band + ' · ' + preset.bps + ' bits/s. ' +
-      preset.description + ' Emisión estimada: <strong>' + formatSeconds(seconds) + '</strong>.';
+    var wav = PHY.encodeWav(rendered.samples, PHY.SR);
+    var blob = new Blob([wav], { type: 'audio/wav' });
+    var url = URL.createObjectURL(blob);
+    return {
+      text: rendered.text,
+      samples: rendered.samples,
+      duration: rendered.duration,
+      preset: rendered.preset,
+      reps: rendered.reps,
+      blob: blob,
+      url: url,
+      fileName: slugFor(rendered.text)
+    };
   }
 
-  function onSettingsChanged() {
-    saveSettings();
-    syncSettingsUI();
-  }
-
-  els.profileRapido.addEventListener('change', function () {
-    if (!els.profileRapido.checked) return;
-    state.settings.preset = 'rapido';
-    onSettingsChanged();
-  });
-
-  els.profileNormal.addEventListener('change', function () {
-    if (!els.profileNormal.checked) return;
-    state.settings.preset = 'normal';
-    onSettingsChanged();
-  });
-
-  els.profileAlcance.addEventListener('change', function () {
-    if (!els.profileAlcance.checked) return;
-    state.settings.preset = 'alcance';
-    state.settings.reps = 3;
-    onSettingsChanged();
-  });
-
-  els.rangeReps.addEventListener('input', function () {
-    var value = Math.round(Number(els.rangeReps.value));
-    state.settings.reps = Math.min(5, Math.max(1, value));
-    els.repsValue.textContent = String(state.settings.reps);
-    updateSettingsNote();
-    saveSettings();
-  });
-
-  els.rangeVolume.addEventListener('input', function () {
-    var value = Math.round(Number(els.rangeVolume.value));
-    state.settings.volume = Math.min(100, Math.max(10, value));
-    els.volumeValue.textContent = String(state.settings.volume);
-    saveSettings();
-  });
-
-  function openSettings() {
-    els.settingsPanel.classList.add('open');
-    els.settingsPanel.setAttribute('aria-hidden', 'false');
-    els.btnSettings.setAttribute('aria-expanded', 'true');
-    updateSettingsNote();
-  }
-
-  function closeSettings() {
-    els.settingsPanel.classList.remove('open');
-    els.settingsPanel.setAttribute('aria-hidden', 'true');
-    els.btnSettings.setAttribute('aria-expanded', 'false');
-  }
-
-  els.btnSettings.addEventListener('click', function () {
-    if (els.settingsPanel.classList.contains('open')) closeSettings();
-    else openSettings();
-  });
-  els.btnCloseSettings.addEventListener('click', closeSettings);
-
-  document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape' && els.settingsPanel.classList.contains('open')) closeSettings();
-  });
-
-  document.addEventListener('pointerdown', function (event) {
-    if (!els.settingsPanel.classList.contains('open')) return;
-    if (els.settingsPanel.contains(event.target) || els.btnSettings.contains(event.target)) return;
-    closeSettings();
-  });
-
-  /* ------------------------------------------------------------------ *
-   * Emisión de audio
-   * ------------------------------------------------------------------ */
-
-  function getPlayContext() {
-    if (!state.audioCtx) {
-      var Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) throw new Error('Sin Web Audio');
-      state.audioCtx = new Ctx({ sampleRate: PHY.SR, latencyHint: 'interactive' });
+  function buildWave(seedText) {
+    var wave = document.createElement('div');
+    wave.className = 'voice-wave';
+    wave.setAttribute('aria-hidden', 'true');
+    var seed = 2166136261;
+    var i;
+    for (i = 0; i < seedText.length; i++) {
+      seed ^= seedText.charCodeAt(i);
+      seed = Math.imul(seed, 16777619) >>> 0;
     }
-    if (state.audioCtx.state === 'suspended') {
-      state.audioCtx.resume().catch(function () {});
+    for (i = 0; i < 30; i++) {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      var bar = document.createElement('span');
+      bar.style.height = (22 + (seed % 76)) + '%';
+      wave.appendChild(bar);
     }
-    return state.audioCtx;
+    return wave;
   }
 
-  function stopPlayback() {
+  function ensureAudio(entry) {
+    if (entry.audio) return entry.audio;
+    var audio = new Audio(entry.url);
+    audio.preload = 'auto';
+    audio.addEventListener('ended', function () {
+      if (state.playing && state.playing.entry === entry) {
+        cancelAnimationFrame(state.playing.raf);
+        state.playing = null;
+      }
+      unmuteMicAfterPlayback();
+      updateVoiceUI(entry, false);
+      setProgress(entry, 0);
+      if (entry.direction === 'out') setEntryState(entry, 'audio listo');
+    });
+    audio.addEventListener('error', function () {
+      toast('No se pudo reproducir este audio.', 'error');
+    });
+    entry.audio = audio;
+    return audio;
+  }
+
+  function updateVoiceUI(entry, playing) {
+    if (!entry.voiceEl) return;
+    entry.voiceEl.classList.toggle('playing', playing);
+    if (entry.toggleEl) {
+      var label = playing ? 'Pausar audio' : 'Reproducir audio';
+      entry.toggleEl.setAttribute('aria-label', label);
+      entry.toggleEl.title = playing ? 'Pausar' : 'Reproducir';
+    }
+  }
+
+  function setProgress(entry, pct) {
+    if (!entry.trackEl) return;
+    var value = Math.max(0, Math.min(100, pct));
+    entry.trackEl.style.setProperty('--p', value.toFixed(2) + '%');
+    entry.trackEl.setAttribute('aria-valuenow', String(Math.round(value)));
+    if (entry.durationEl) entry.durationEl.textContent = formatClock(entry.duration);
+  }
+
+  function setEntryState(entry, text) {
+    if (entry.stateEl) entry.stateEl.textContent = text;
+  }
+
+  function startProgress(entry) {
+    function frame() {
+      if (!state.playing || state.playing.entry !== entry) return;
+      var audio = entry.audio;
+      var duration = audio && isFinite(audio.duration) && audio.duration > 0
+        ? audio.duration
+        : entry.duration;
+      var pct = duration > 0 && audio ? (audio.currentTime / duration) * 100 : 0;
+      setProgress(entry, pct);
+      state.playing.raf = requestAnimationFrame(frame);
+    }
+    state.playing.raf = requestAnimationFrame(frame);
+  }
+
+  function stopPlayback(silent) {
     var playing = state.playing;
     if (!playing) return;
-    try {
-      playing.source.onended = null;
-      playing.source.stop();
-    } catch (e) { /* ya terminó */ }
-    finishPlayback(playing);
-  }
-
-  function finishPlayback(playing) {
-    if (state.playing !== playing) return;
-    cancelAnimationFrame(playing.raf);
+    var entry = playing.entry;
     state.playing = null;
-    if (!playing.bubble) return;
-    playing.bubble.classList.remove('emitting');
-    var stateEl = playing.bubble.querySelector('.msg-state');
-    if (stateEl) stateEl.textContent = 'emitido';
-    var fill = playing.bubble.querySelector('.msg-progress span');
-    if (fill) fill.style.width = '100%';
+    cancelAnimationFrame(playing.raf);
+    if (entry.audio) {
+      try { entry.audio.pause(); } catch (e) { /* nada */ }
+    }
+    unmuteMicAfterPlayback();
+    updateVoiceUI(entry, false);
+    if (!silent && entry.direction === 'out') {
+      setEntryState(entry, entry.audio && entry.audio.currentTime > 0.05 ? 'en pausa' : 'audio listo');
+    }
   }
 
-  function playEmission(emission, bubble) {
-    stopPlayback();
-    var ctx;
-    try {
-      ctx = getPlayContext();
-    } catch (e) {
-      toast('Este navegador no puede reproducir audio.', 'error');
-      if (bubble) {
-        bubble.classList.remove('emitting');
-        var s = bubble.querySelector('.msg-state');
-        if (s) s.textContent = 'error';
-      }
+  function muteMicForPlayback(entry) {
+    state.micMutedUntil = Date.now() + (entry.duration + 0.6) * 1000;
+    state.lastEmitted = {
+      text: entry.text,
+      until: Date.now() + entry.duration * 1000 + ECHO_MARGIN_MS
+    };
+    if (state.mic.decoder) {
+      try { state.mic.decoder.reset(); } catch (e) { /* nada */ }
+    }
+  }
+
+  function unmuteMicAfterPlayback() {
+    state.micMutedUntil = Date.now() + 300;
+    if (state.mic.decoder) {
+      try { state.mic.decoder.reset(); } catch (e) { /* nada */ }
+    }
+  }
+
+  function playEntry(entry) {
+    if (!entry || !entry.url) return;
+    stopPlayback(true);
+    var audio = ensureAudio(entry);
+    if (!audio.paused) {
+      stopPlayback(false);
       return;
     }
-    var samples = emission.samples;
-    if (ctx.sampleRate !== PHY.SR) {
-      samples = PHY.resample(samples, PHY.SR, ctx.sampleRate);
+    if (audio.ended || (isFinite(audio.duration) && audio.currentTime >= audio.duration - 0.02)) {
+      try { audio.currentTime = 0; } catch (e) { /* nada */ }
     }
-    var buffer = ctx.createBuffer(1, samples.length, ctx.sampleRate);
-    if (buffer.copyToChannel) buffer.copyToChannel(samples, 0);
-    else buffer.getChannelData(0).set(samples);
+    muteMicForPlayback(entry);
+    state.playing = { entry: entry, raf: 0 };
+    updateVoiceUI(entry, true);
+    if (entry.direction === 'out') setEntryState(entry, 'reproduciendo…');
+    startProgress(entry);
 
-    var source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-
-    var playing = {
-      source: source,
-      emission: emission,
-      bubble: bubble || null,
-      started: 0,
-      raf: 0,
-      duration: emission.duration
-    };
-    state.playing = playing;
-
-    if (bubble) {
-      bubble.classList.add('emitting');
-      var stateEl = bubble.querySelector('.msg-state');
-      if (stateEl) stateEl.textContent = 'reproduciendo…';
-      var fill = bubble.querySelector('.msg-progress span');
-      if (fill) fill.style.width = '0%';
-    }
-
-    state.lastEmitted = {
-      text: emission.text,
-      until: Date.now() + emission.duration * 1000 + ECHO_MARGIN_MS
-    };
-
-    source.onended = function () { finishPlayback(playing); };
-    playing.started = performance.now();
-
-    function frame() {
-      if (state.playing !== playing) return;
-      var elapsed = (performance.now() - playing.started) / 1000;
-      var pct = Math.min(100, Math.max(0, elapsed / emission.duration * 100));
-      var bar = playing.bubble && playing.bubble.querySelector('.msg-progress span');
-      if (bar) bar.style.width = pct.toFixed(1) + '%';
-      playing.raf = requestAnimationFrame(frame);
-    }
-    playing.raf = requestAnimationFrame(frame);
-
+    var promise;
     try {
-      source.start(0);
+      promise = audio.play();
     } catch (e) {
-      finishPlayback(playing);
-      toast('No se pudo emitir el mensaje.', 'error');
+      promise = null;
     }
+    if (promise && typeof promise.catch === 'function') {
+      promise.catch(function () {
+        if (state.playing && state.playing.entry === entry) {
+          cancelAnimationFrame(state.playing.raf);
+          state.playing = null;
+        }
+        updateVoiceUI(entry, false);
+        if (entry.direction === 'out') setEntryState(entry, 'audio listo');
+        toast('Toca ▶ para escuchar el audio.');
+      });
+    }
+  }
+
+  function buildVoice(entry) {
+    var voice = document.createElement('div');
+    voice.className = 'voice';
+
+    var toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'voice-toggle';
+    toggle.setAttribute('aria-label', 'Reproducir audio');
+    toggle.title = 'Reproducir';
+    toggle.innerHTML = ICON_PLAY + ICON_PAUSE;
+    toggle.addEventListener('click', function () {
+      var audio = ensureAudio(entry);
+      if (!audio.paused) stopPlayback(false);
+      else playEntry(entry);
+    });
+    voice.appendChild(toggle);
+
+    var track = document.createElement('div');
+    track.className = 'voice-track';
+    track.setAttribute('role', 'slider');
+    track.setAttribute('aria-label', 'Progreso del audio');
+    track.setAttribute('aria-valuemin', '0');
+    track.setAttribute('aria-valuemax', '100');
+    track.setAttribute('aria-valuenow', '0');
+    track.setAttribute('tabindex', '0');
+    track.style.setProperty('--p', '0%');
+    track.appendChild(buildWave(entry.text));
+
+    var overlay = document.createElement('div');
+    overlay.className = 'voice-overlay';
+    overlay.appendChild(buildWave(entry.text));
+    track.appendChild(overlay);
+
+    function seekFromEvent(event) {
+      var rect = track.getBoundingClientRect();
+      if (!rect.width) return;
+      var pct = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      var audio = ensureAudio(entry);
+      try { audio.currentTime = pct * entry.duration; } catch (e) { /* metadatos aún no listos */ }
+      setProgress(entry, pct * 100);
+    }
+
+    track.addEventListener('click', seekFromEvent);
+    track.addEventListener('keydown', function (event) {
+      var audio = ensureAudio(entry);
+      if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+        event.preventDefault();
+        var step = event.key === 'ArrowRight' ? 2 : -2;
+        try { audio.currentTime = Math.max(0, Math.min(entry.duration, audio.currentTime + step)); } catch (e) { /* nada */ }
+        setProgress(entry, (audio.currentTime / entry.duration) * 100);
+      } else if (event.key === ' ' || event.key === 'Enter') {
+        event.preventDefault();
+        if (audio.paused) playEntry(entry);
+        else stopPlayback(false);
+      }
+    });
+
+    voice.appendChild(track);
+
+    var duration = document.createElement('span');
+    duration.className = 'voice-duration';
+    duration.textContent = formatClock(entry.duration);
+    voice.appendChild(duration);
+
+    entry.voiceEl = voice;
+    entry.toggleEl = toggle;
+    entry.trackEl = track;
+    entry.durationEl = duration;
+    return voice;
+  }
+
+  function miniButton(icon, label, handler) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn-mini';
+    button.innerHTML = icon;
+    button.setAttribute('aria-label', label);
+    button.title = label;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  function downloadEntry(entry) {
+    if (!entry.url) return;
+    var link = document.createElement('a');
+    link.href = entry.url;
+    link.download = entry.fileName;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    toast('Audio descargado. Compártelo con el otro teléfono.', 'ok');
+  }
+
+  function shareEntry(entry) {
+    if (!entry.blob) {
+      downloadEntry(entry);
+      return;
+    }
+    var file = null;
+    try {
+      file = new File([entry.blob], entry.fileName, { type: 'audio/wav' });
+    } catch (e) { /* sin File */ }
+
+    if (file && navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      navigator.share({
+        files: [file],
+        title: 'SoundBridge',
+        text: 'Audio de SoundBridge'
+      }).catch(function () { /* compartir cancelado */ });
+      return;
+    }
+    downloadEntry(entry);
+  }
+
+  function copyEntry(entry) {
+    function done() {
+      toast('Texto copiado', 'ok');
+    }
+    function fallback() {
+      var area = document.createElement('textarea');
+      area.value = entry.text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(area);
+      if (ok) done();
+      else toast('No se pudo copiar el texto.', 'error');
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(entry.text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  function buildActions(entry) {
+    var actions = document.createElement('span');
+    actions.className = 'msg-actions';
+    actions.appendChild(miniButton(ICON_SHARE, 'Compartir audio', function () { shareEntry(entry); }));
+    actions.appendChild(miniButton(ICON_DOWNLOAD, 'Descargar audio', function () { downloadEntry(entry); }));
+    actions.appendChild(miniButton(ICON_COPY, 'Copiar texto', function () { copyEntry(entry); }));
+    return actions;
   }
 
   /* ------------------------------------------------------------------ *
@@ -392,53 +496,142 @@
     article.dataset.id = 'm' + id;
     article.setAttribute('role', 'listitem');
 
+    var entry = {
+      id: 'm' + id,
+      direction: 'out',
+      text: text,
+      time: Date.now(),
+      label: '',
+      duration: emission.duration,
+      preset: emission.preset,
+      reps: emission.reps,
+      samples: emission.samples,
+      blob: emission.blob,
+      url: emission.url,
+      fileName: emission.fileName,
+      el: article,
+      audio: null
+    };
+
     var p = document.createElement('p');
     p.className = 'msg-text';
     p.textContent = text;
     article.appendChild(p);
 
+    article.appendChild(buildVoice(entry));
+
     var meta = document.createElement('div');
     meta.className = 'msg-meta';
-
-    var duration = document.createElement('span');
-    duration.className = 'msg-duration';
-    duration.textContent = formatSeconds(emission.duration);
-    meta.appendChild(duration);
 
     var stateEl = document.createElement('span');
     stateEl.className = 'msg-state';
     stateEl.textContent = 'reproduciendo…';
     meta.appendChild(stateEl);
+    entry.stateEl = stateEl;
 
     var time = document.createElement('span');
     time.className = 'msg-time';
-    time.textContent = formatTime(new Date());
+    time.textContent = formatTime(new Date(entry.time));
     meta.appendChild(time);
-
-    var replay = document.createElement('button');
-    replay.type = 'button';
-    replay.className = 'btn-replay';
-    replay.setAttribute('aria-label', 'Volver a emitir este mensaje');
-    replay.title = 'Volver a emitir';
-    replay.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v5h5M4.5 14a8 8 0 1 0 2-7.5L4 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
-    replay.addEventListener('click', function () {
-      playEmission(emission, article);
-    });
-    meta.appendChild(replay);
+    meta.appendChild(buildActions(entry));
 
     article.appendChild(meta);
-
-    var progress = document.createElement('div');
-    progress.className = 'msg-progress';
-    progress.appendChild(document.createElement('span'));
-    article.appendChild(progress);
-
     els.messages.appendChild(article);
-    state.messages.push({ id: 'm' + id, direction: 'out', text: text, time: Date.now() });
-    state.emissions.set('m' + id, emission);
+
+    state.entries.push(entry);
     hideEmptyState();
     scrollToBottom();
-    return article;
+    return entry;
+  }
+
+  function buildIncoming(text, options) {
+    options = options || {};
+    var id = ++state.seq;
+    var article = document.createElement('article');
+    article.className = 'msg';
+    article.dataset.direction = 'in';
+    article.dataset.label = options.label === 'transcrito' ? 'transcrito' : 'mic';
+    article.dataset.id = 'm' + id;
+    article.setAttribute('role', 'listitem');
+
+    var label = document.createElement('span');
+    label.className = 'msg-label';
+    if (options.label === 'transcrito') {
+      label.textContent = 'audio transcrito';
+    } else {
+      var preset = PHY.getPreset(options.preset || EMIT_PRESET);
+      label.textContent = 'audio recibido · ' + preset.name;
+    }
+    article.appendChild(label);
+
+    var p = document.createElement('p');
+    p.className = 'msg-text';
+    p.textContent = text;
+    article.appendChild(p);
+
+    var entry = {
+      id: 'm' + id,
+      direction: 'in',
+      text: text,
+      time: Date.now(),
+      label: options.label === 'transcrito' ? 'transcrito' : 'mic',
+      preset: options.preset || EMIT_PRESET,
+      el: article,
+      audio: null,
+      duration: 0,
+      blob: null,
+      url: '',
+      fileName: '',
+      count: 1,
+      countEl: null
+    };
+
+    // El audio recibido se puede escuchar y reenviar: se regenera a partir del texto.
+    try {
+      var emission = createEmission(text, {
+        preset: entry.preset,
+        reps: RECEIVE_REPS,
+        amplitude: RECEIVE_VOLUME
+      });
+      entry.duration = emission.duration;
+      entry.samples = emission.samples;
+      entry.blob = emission.blob;
+      entry.url = emission.url;
+      entry.fileName = emission.fileName;
+    } catch (e) {
+      entry.duration = 0;
+    }
+    if (entry.url) article.appendChild(buildVoice(entry));
+
+    var meta = document.createElement('div');
+    meta.className = 'msg-meta';
+
+    var count = document.createElement('span');
+    count.className = 'msg-count';
+    meta.appendChild(count);
+    entry.countEl = count;
+
+    var time = document.createElement('span');
+    time.className = 'msg-time';
+    time.textContent = formatTime(new Date(entry.time));
+    meta.appendChild(time);
+    entry.timeEl = time;
+
+    var received = document.createElement('span');
+    received.className = 'msg-received';
+    received.textContent = '✓✓';
+    received.title = 'Recibido';
+    meta.appendChild(received);
+
+    meta.appendChild(buildActions(entry));
+    article.appendChild(meta);
+    els.messages.appendChild(article);
+
+    state.entries.push(entry);
+    state.incoming.push(entry);
+    hideEmptyState();
+    scrollToBottom();
+    return entry;
   }
 
   function findIncomingDuplicate(text) {
@@ -454,83 +647,31 @@
     return null;
   }
 
-  function buildIncoming(text, options) {
-    options = options || {};
-    var now = new Date();
-    var duplicate = findIncomingDuplicate(text);
-    if (duplicate) {
-      duplicate.count++;
-      duplicate.time = now.getTime();
-      var countEl = duplicate.el.querySelector('.msg-count');
-      if (countEl) {
-        countEl.textContent = '×' + duplicate.count;
-        countEl.classList.add('show');
-      }
-      var timeEl = duplicate.el.querySelector('.msg-time');
-      if (timeEl) timeEl.textContent = formatTime(now);
-      return duplicate.el;
-    }
-
-    var id = ++state.seq;
-    var article = document.createElement('article');
-    article.className = 'msg';
-    article.dataset.direction = 'in';
-    article.dataset.label = options.label === 'transcrito' ? 'transcrito' : 'mic';
-    article.dataset.id = 'm' + id;
-    article.setAttribute('role', 'listitem');
-
-    var label = document.createElement('span');
-    label.className = 'msg-label';
-    if (options.label === 'transcrito') {
-      label.textContent = 'audio transcrito';
-    } else {
-      var preset = PHY.getPreset(options.preset || state.settings.preset);
-      label.textContent = 'recibido · ' + preset.name;
-    }
-    article.appendChild(label);
-
-    var p = document.createElement('p');
-    p.className = 'msg-text';
-    p.textContent = text;
-    article.appendChild(p);
-
-    var meta = document.createElement('div');
-    meta.className = 'msg-meta';
-
-    var count = document.createElement('span');
-    count.className = 'msg-count';
-    meta.appendChild(count);
-
-    var time = document.createElement('span');
-    time.className = 'msg-time';
-    time.textContent = formatTime(now);
-    meta.appendChild(time);
-
-    var received = document.createElement('span');
-    received.className = 'msg-received';
-    received.textContent = '✓✓';
-    received.title = 'Recibido';
-    meta.appendChild(received);
-
-    article.appendChild(meta);
-    els.messages.appendChild(article);
-
-    var entry = { el: article, text: text, time: now.getTime(), count: 1 };
-    state.incoming.push(entry);
-    state.messages.push({ id: 'm' + id, direction: 'in', text: text, time: now.getTime() });
-    hideEmptyState();
-    scrollToBottom();
-    return article;
-  }
-
   function addIncoming(text, options) {
     options = options || {};
     var clean = PHY.normalizeText(text);
     if (!clean) return null;
-    if (state.lastEmitted && state.lastEmitted.text === clean && Date.now() < state.lastEmitted.until) {
+    if (options.label !== 'transcrito' &&
+        state.lastEmitted &&
+        state.lastEmitted.text === clean &&
+        Date.now() < state.lastEmitted.until) {
       // Eco del propio altavoz capturado por el micrófono.
       return null;
     }
+
+    var duplicate = findIncomingDuplicate(clean);
+    if (duplicate) {
+      duplicate.count++;
+      duplicate.time = Date.now();
+      duplicate.timeEl.textContent = formatTime(new Date(duplicate.time));
+      if (duplicate.countEl) {
+        duplicate.countEl.textContent = '×' + duplicate.count;
+        duplicate.countEl.classList.add('show');
+      }
+      scrollToBottom();
+      return duplicate;
+    }
+
     return buildIncoming(clean, options);
   }
 
@@ -552,30 +693,23 @@
     }
     els.inputText.value = '';
     autoGrow();
-    updateSettingsNote();
 
-    var rendered;
+    var emission;
     try {
-      rendered = PHY.renderAudio(limited.text, {
-        preset: state.settings.preset,
-        reps: state.settings.reps,
-        amplitude: state.settings.volume / 100
-      });
+      emission = createEmission(limited.text);
     } catch (e) {
-      toast('No se pudo preparar el audio del mensaje.', 'error');
+      toast('No se pudo generar el audio del mensaje.', 'error');
       return;
     }
 
-    var emission = {
+    var first = state.entries.length === 0;
+    var entry = buildOutgoing(limited.text, emission);
+    state.lastEmitted = {
       text: limited.text,
-      samples: rendered.samples,
-      duration: rendered.duration,
-      preset: rendered.preset,
-      reps: rendered.reps
+      until: Date.now() + emission.duration * 1000 + ECHO_MARGIN_MS
     };
-
-    var bubble = buildOutgoing(limited.text, emission);
-    playEmission(emission, bubble);
+    if (first) toast('Audio generado. Compártelo o ábrelo en otro teléfono.', 'ok');
+    playEntry(entry);
   }
 
   els.composer.addEventListener('submit', function (event) {
@@ -590,17 +724,14 @@
     }
   });
 
-  els.inputText.addEventListener('input', function () {
-    autoGrow();
-    updateSettingsNote();
-  });
+  els.inputText.addEventListener('input', autoGrow);
 
   /* ------------------------------------------------------------------ *
-   * Micrófono
+   * Micrófono opcional
    * ------------------------------------------------------------------ */
 
   var WORKLET_CODE = [
-    'class SusurroMic extends AudioWorkletProcessor {',
+    'class SoundBridgeMic extends AudioWorkletProcessor {',
     '  process(inputs) {',
     '    const input = inputs[0];',
     '    const channel = input && input[0];',
@@ -608,7 +739,7 @@
     '    return true;',
     '  }',
     '}',
-    'registerProcessor("susurro-mic", SusurroMic);'
+    'registerProcessor("soundbridge-mic", SoundBridgeMic);'
   ].join('\n');
 
   function isSecureForMic() {
@@ -632,17 +763,23 @@
     return 'No se pudo activar el micrófono. Revisa los permisos.';
   }
 
-  function setListenUI(active, busy) {
-    els.btnListen.classList.toggle('active', !!active);
-    els.btnListen.setAttribute('aria-pressed', active ? 'true' : 'false');
-    els.btnListen.disabled = !!busy;
-    els.btnListen.setAttribute('aria-busy', busy ? 'true' : 'false');
-    if (els.listenLabel) els.listenLabel.textContent = busy ? 'Conectando…' : (active ? 'Escuchando' : 'Escuchar');
+  function setMicUI(active, busy) {
+    els.btnMic.classList.toggle('active', !!active);
+    els.btnMic.setAttribute('aria-pressed', active ? 'true' : 'false');
+    els.btnMic.disabled = !!busy;
+    els.btnMic.setAttribute('aria-busy', busy ? 'true' : 'false');
+    els.micLevel.classList.toggle('off', !active);
+    if (active) els.btnMic.classList.remove('attention');
+    var label = busy ? 'Conectando micrófono…' : (active ? 'Silenciar micrófono' : 'Activar micrófono');
+    els.btnMic.setAttribute('aria-label', label);
+    els.btnMic.title = busy ? 'Conectando…' : (active ? 'Micrófono activo · toca para silenciar' : 'Micrófono · toca para activar');
   }
 
   function pushMicSamples(data, rate) {
     var mic = state.mic;
     if (!mic.active || !mic.decoder) return;
+    // Mientras este teléfono reproduce su propio audio, no se escucha a sí mismo.
+    if (Date.now() < state.micMutedUntil) return;
     var samples = data;
     if (!(samples instanceof Float32Array)) samples = Float32Array.from(data);
     if (rate && rate !== PHY.SR) samples = PHY.resample(samples, rate, PHY.SR);
@@ -667,7 +804,7 @@
   function handleMicPacket(packet) {
     var added = addIncoming(packet.text, { label: 'mic', preset: packet.preset });
     if (!added) return;
-    setStatus('Mensaje recibido', 'received');
+    setStatus('Mensaje recibido · texto listo', 'received');
     scheduleStatusRevert();
     if (navigator.vibrate) {
       try { navigator.vibrate(35); } catch (e) { /* opcional */ }
@@ -679,7 +816,7 @@
     var url = URL.createObjectURL(new Blob([WORKLET_CODE], { type: 'application/javascript' }));
     return ctx.audioWorklet.addModule(url).then(function () {
       URL.revokeObjectURL(url);
-      return new AudioWorkletNode(ctx, 'susurro-mic', {
+      return new AudioWorkletNode(ctx, 'soundbridge-mic', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1]
@@ -690,22 +827,24 @@
     });
   }
 
-  async function startMic() {
+  async function startMic(options) {
+    options = options || {};
+    var auto = options.auto === true;
     if (state.mic.active || state.mic.busy) return;
     if (!isSecureForMic()) {
       setStatus('El micrófono requiere HTTPS o localhost', 'error');
-      toast('El micrófono requiere HTTPS o localhost.', 'error');
+      if (!auto) toast('El micrófono requiere HTTPS o localhost.', 'error');
       return;
     }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus('Micrófono no disponible', 'error');
-      toast('Este navegador no permite usar el micrófono.', 'error');
+      if (!auto) toast('Este navegador no permite usar el micrófono.', 'error');
       return;
     }
 
     state.mic.busy = true;
-    setListenUI(false, true);
-    setStatus('Solicitando micrófono…', 'syncing');
+    setMicUI(false, true);
+    setStatus('Activando micrófono…', 'syncing');
 
     var stream = null;
     try {
@@ -721,7 +860,10 @@
 
       var Ctx = window.AudioContext || window.webkitAudioContext;
       var ctx = new Ctx({ sampleRate: PHY.SR, latencyHint: 'interactive' });
-      if (ctx.state === 'suspended') await ctx.resume();
+      if (ctx.state === 'suspended') {
+        // Sin gesto de usuario puede quedar suspendido; se reanuda al primer toque.
+        ctx.resume().catch(function () {});
+      }
 
       var source = ctx.createMediaStreamSource(stream);
       var sink = ctx.createGain();
@@ -788,15 +930,15 @@
         });
       }
 
-      setListenUI(true, false);
-      setStatus('Escuchando…', 'listening');
-      toast('Micrófono activo. Escuchando mensajes…', 'ok');
+      setMicUI(true, false);
+      setStatus('Micrófono activo · escuchando', 'listening');
+      toast('Micrófono activo. También puedes compartir los audios.', 'ok');
     } catch (error) {
       if (stream) {
         try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* nada */ }
       }
       state.mic.busy = false;
-      setListenUI(false, false);
+      setMicUI(false, false);
       var message = micErrorMessage(error);
       setStatus(message, 'error');
       toast(message, 'error');
@@ -827,18 +969,18 @@
     mic.decoder = null;
     mic.level = 0;
     els.levelFill.style.width = '2%';
-    setListenUI(false, false);
-    setStatus('Micrófono apagado', '');
+    setMicUI(false, false);
+    baseStatus();
   }
 
-  els.btnListen.addEventListener('click', function () {
+  els.btnMic.addEventListener('click', function () {
     if (state.mic.busy) return;
     if (state.mic.active) stopMic();
     else startMic();
   });
 
   /* ------------------------------------------------------------------ *
-   * Transcripción de archivos
+   * Transcripción de archivos (sin micrófono)
    * ------------------------------------------------------------------ */
 
   function decodeAudioFile(arrayBuffer) {
@@ -885,11 +1027,14 @@
       // Deja pintar el estado antes de decodificar (puede tardar).
       await new Promise(function (resolve) { setTimeout(resolve, 20); });
       var results = PHY.decodeBuffer(data, { sampleRate: rate });
+
       if (!results.length) {
-        toast('El archivo no contiene ningún mensaje de Susurro.', 'error');
-        setStatus(micWasActive ? 'Escuchando…' : 'Micrófono apagado', micWasActive ? 'listening' : '');
+        toast('El audio no contiene ningún mensaje de SoundBridge.', 'error');
+        setStatus(micWasActive ? 'Micrófono activo · escuchando' : 'Listo · escribe un mensaje',
+          micWasActive ? 'listening' : '');
         return;
       }
+
       var added = 0;
       for (var i = 0; i < results.length; i++) {
         if (addIncoming(results[i].text, { label: 'transcrito', preset: results[i].preset })) added++;
@@ -897,9 +1042,9 @@
       if (added === 0) {
         toast('El audio solo contenía ecos del propio dispositivo.', 'error');
       } else {
-        toast(added === 1 ? 'Audio transcrito' : added + ' mensajes transcritos', 'ok');
+        toast(added === 1 ? 'Audio transcrito · texto listo' : added + ' mensajes transcritos', 'ok');
       }
-      setStatus('Mensaje recibido', 'received');
+      setStatus('Audio transcrito · texto listo', 'received');
       scheduleStatusRevert();
     } catch (error) {
       var message = 'No se pudo leer el archivo de audio.';
@@ -907,11 +1052,18 @@
         message = 'Formato de audio no compatible.';
       }
       toast(message, 'error');
-      setStatus(micWasActive ? 'Escuchando…' : 'Micrófono apagado', micWasActive ? 'listening' : '');
+      setStatus(micWasActive ? 'Micrófono activo · escuchando' : 'Listo · escribe un mensaje',
+        micWasActive ? 'listening' : '');
     } finally {
       state.transcribing = false;
       els.fileInput.value = '';
     }
+  }
+
+  function isAudioFile(file) {
+    if (!file) return false;
+    if (file.type && file.type.indexOf('audio/') === 0) return true;
+    return /\.(wav|mp3|m4a|ogg|webm)$/i.test(file.name || '');
   }
 
   els.btnClip.addEventListener('click', function () {
@@ -923,15 +1075,37 @@
     if (file) transcribeFile(file);
   });
 
+  // Arrastrar y soltar un audio sobre la conversación.
+  ['dragenter', 'dragover'].forEach(function (name) {
+    els.chat.addEventListener(name, function (event) {
+      event.preventDefault();
+      els.chat.classList.add('dragover');
+    });
+  });
+  ['dragleave', 'dragend'].forEach(function (name) {
+    els.chat.addEventListener(name, function (event) {
+      if (event.target === els.chat || !els.chat.contains(event.relatedTarget)) {
+        els.chat.classList.remove('dragover');
+      }
+    });
+  });
+  els.chat.addEventListener('drop', function (event) {
+    event.preventDefault();
+    els.chat.classList.remove('dragover');
+    var file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+    if (!file) return;
+    if (isAudioFile(file)) transcribeFile(file);
+    else toast('Selecciona un archivo de audio.', 'error');
+  });
+
   /* ------------------------------------------------------------------ *
    * Arranque
    * ------------------------------------------------------------------ */
 
   function init() {
-    loadSettings();
-    syncSettingsUI();
-    updateConnection();
+    setMicUI(false, false);
     baseStatus();
+    updateConnection();
     autoGrow();
     els.levelFill.style.width = '2%';
 
@@ -943,18 +1117,20 @@
     });
 
     // API mínima para pruebas automatizadas.
-    window.Susurro = {
-      version: '1.0.0',
-      settings: function () { return Object.assign({}, state.settings); },
+    window.SoundBridge = {
+      version: '2.0.0',
       messages: function () {
-        return Array.prototype.map.call(document.querySelectorAll('.msg'), function (el) {
+        return state.entries.map(function (entry) {
           return {
-            id: el.dataset.id,
-            direction: el.dataset.direction,
-            label: el.dataset.label || '',
-            text: (el.querySelector('.msg-text') || {}).textContent || '',
-            state: (el.querySelector('.msg-state') || {}).textContent || '',
-            count: (el.querySelector('.msg-count') || {}).textContent || ''
+            id: entry.id,
+            direction: entry.direction,
+            label: entry.label || '',
+            text: entry.text,
+            state: entry.stateEl ? entry.stateEl.textContent : '',
+            count: entry.countEl ? entry.countEl.textContent : '',
+            hasAudio: !!entry.url,
+            duration: entry.duration,
+            playing: !!(entry.audio && !entry.audio.paused)
           };
         });
       },
@@ -963,12 +1139,22 @@
         sendCurrentMessage();
       },
       incoming: function (text, preset) {
-        return !!addIncoming(text, { label: 'mic', preset: preset || state.settings.preset });
+        return !!addIncoming(text, { label: 'mic', preset: preset || EMIT_PRESET });
       },
       transcribe: function (buffer, name) {
         var file = new File([buffer], name || 'audio.wav', { type: 'audio/wav' });
         return transcribeFile(file);
-      }
+      },
+      play: function (id) {
+        for (var i = 0; i < state.entries.length; i++) {
+          if (state.entries[i].id === id) {
+            playEntry(state.entries[i]);
+            return true;
+          }
+        }
+        return false;
+      },
+      stop: function () { stopPlayback(false); }
     };
   }
 
