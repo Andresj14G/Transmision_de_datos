@@ -1,0 +1,13 @@
+tests/
+servidor.js
+abrir.bat
+vercel.json
+.vercelignore
+node_modules/
+.vercel/
+.env
+.env.*
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
