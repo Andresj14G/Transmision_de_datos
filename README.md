@@ -167,6 +167,7 @@ Playwright.
 node tests/phy.test.js   # módem: 23 pruebas
 node tests/ui.test.js    # interfaz en Chrome headless
 node tests/mic.test.js   # micrófono falso de Chrome
+node tests/experimentos.js todo   # experimentos del artículo (unos 10 min; escribe resultados.json)
 ```
 
 > **Estado actual:** `tests/phy.test.js` es válida para esta versión. `tests/ui.test.js` y
@@ -213,6 +214,7 @@ tests/phy.test.js  Pruebas del módem
 tests/ui.test.js   Pruebas de la interfaz
 tests/mic.test.js  Recepción por micrófono simulado
 tests/cdp.js       Cliente mínimo de Chrome DevTools Protocol usado por las pruebas
+tests/experimentos.js  Experimentos del artículo (ruido, reverberación, ráfagas, modelo teórico…)
 ```
 
 ---
